@@ -2,360 +2,7 @@ import {
   IExecuteFunctions,
   INodeExecutionData,
   INodeType,
-  INodeTypeDescription,// src/OpenAITextRefinery.node.ts
-// A conservative, robust n8n node skeleton implementing the smart-chunk pipeline
-// Uses many `as any` casts to avoid strict TS breakage inside different n8n setups.
-// Requires: OpenAI API key in env OPENAI_API_KEY (or adapt to use n8n credentials/helpers).
-
-import { IExecuteFunctions } from 'n8n-core';
-import {
-  INodeType,
   INodeTypeDescription,
-  INodeExecutionData,
-} from 'n8n-workflow';
-
-type MemoryShape = {
-  version?: number;
-  style_profile?: any;
-  term_dictionary?: Record<string,string>;
-  globalSummary?: string;
-  chunks?: Record<string, any>;
-  lastUpdated?: string;
-};
-
-export default class OpenAITextRefinery implements INodeType {
-  description: INodeTypeDescription = {
-    displayName: 'OpenAI Text Refinery (Smart Node)',
-    name: 'openaiTextRefinerySmart',
-    group: ['transform'],
-    version: 1,
-    description: 'Smart node: chunking + memory + multi-stage editing + final coherence',
-    defaults: { name: 'OpenAI Text Refinery (Smart)' , color: '#1A82e2' },
-    inputs: ['main'],
-    outputs: ['main'],
-    credentials: [],
-    properties: [
-      {
-        displayName: 'Target language',
-        name: 'targetLanguage',
-        type: 'string',
-        default: 'fa',
-        description: 'Target language code (e.g. fa, en)',
-      },
-      {
-        displayName: 'Style hint',
-        name: 'styleHint',
-        type: 'string',
-        default: 'formal',
-        description: 'Preferred style (formal, casual, academic...)',
-      },
-      {
-        displayName: 'Chunk size (chars)',
-        name: 'chunkSize',
-        type: 'number',
-        default: 3000,
-      },
-      {
-        displayName: 'Memory mode',
-        name: 'memoryMode',
-        type: 'options',
-        options: [
-          { name: 'workflowStatic', value: 'workflowStatic' },
-          { name: 'none', value: 'none' },
-        ],
-        default: 'workflowStatic',
-      },
-    ],
-  };
-
-  // -----------------------
-  // Helper utilities
-  // -----------------------
-  private sha256(str: string) : string {
-    let h = 0;
-    if (str.length === 0) return '0';
-    for (let i = 0; i < str.length; i++) {
-      const c = str.charCodeAt(i);
-      h = ((h << 5) - h) + c;
-      h |= 0;
-    }
-    return String(h);
-  }
-
-  private chunkText(text: string, maxSize = 3000, overlap = 200) : {chunks:string[], heads:string[], tails:string[]} {
-    if (!text) return {chunks:[], heads:[], tails:[]};
-    const sentences = text.split(/(?<=[.؟!?]\s+)/u);
-    const chunks: string[] = [];
-    let cur = '';
-    for (let i = 0; i < sentences.length; i++) {
-      const s = sentences[i];
-      if ((cur + s).length <= maxSize || cur.length === 0) {
-        cur += s;
-      } else {
-        chunks.push(cur.trim());
-        cur = s;
-      }
-    }
-    if (cur.trim()) chunks.push(cur.trim());
-    const heads = chunks.map((c, idx) => {
-      if (idx === 0) return '';
-      const prev = chunks[idx-1];
-      return prev.slice(Math.max(0, prev.length - Math.min(200, prev.length)));
-    });
-    const tails = chunks.map((c, idx) => {
-      if (idx === chunks.length-1) return '';
-      const next = chunks[idx+1];
-      return next.slice(0, Math.min(200, next.length));
-    });
-    return {chunks, heads, tails};
-  }
-
-  // Memory I/O using workflow static data
-  private async readMemory(memoryKey: string, thisNode: IExecuteFunctions, mode: string) : Promise<MemoryShape> {
-    try {
-      if (mode === 'workflowStatic') {
-        const wf = (thisNode as any).getWorkflowStaticData('global') as any;
-        return (wf?.[memoryKey] ?? { version: 0, style_profile: {}, term_dictionary: {}, chunks: {} }) as MemoryShape;
-      }
-    } catch (e) { /* ignore */ }
-    return { version: 0, style_profile: {}, term_dictionary: {}, chunks: {} };
-  }
-
-  private async writeMemory(memoryKey: string, mem: MemoryShape, thisNode: IExecuteFunctions, mode: string) {
-    try {
-      if (mode === 'workflowStatic') {
-        const wf = (thisNode as any).getWorkflowStaticData('global') as any;
-        wf[memoryKey] = mem;
-        return true;
-      }
-    } catch (e) {
-      return false;
-    }
-    return false;
-  }
-
-  // wrappers to prepare OpenAI call options (we'll call via this.helpers.request)
-  private async callOpenAIAPI(prompt: string, maxTokens=800, temperature=0.0) {
-    const key = process.env.OPENAI_API_KEY;
-    if (!key) throw new Error('OPENAI_API_KEY not set in environment');
-    const options: any = {
-      method: 'POST',
-      uri: 'https://api.openai.com/v1/responses',
-      headers: {
-        Authorization: `Bearer ${key}`,
-        'Content-Type': 'application/json',
-      },
-      body: {
-        model: 'gpt-4o-mini',
-        input: prompt,
-        temperature,
-        max_tokens: maxTokens,
-      },
-      json: true,
-    };
-    return options;
-  }
-
-  private async openaiCallFromNode(prompt: string, thisNode: IExecuteFunctions, maxTokens=800, temperature=0.0) {
-    const reqOptions = await this.callOpenAIAPI(prompt, maxTokens, temperature);
-    const res = await (thisNode as any).helpers.request!(reqOptions as any).catch((e: any) => { throw e; });
-    if (res && res.output && Array.isArray(res.output) && res.output.length) {
-      const out = res.output[0];
-      if (typeof out === 'string') return out;
-      if (out.content) {
-        if (typeof out.content === 'string') return out.content;
-        if (Array.isArray(out.content)) return out.content.map((c:any)=> c?.text ?? (typeof c === 'string' ? c : '')).join('\n');
-      }
-    }
-    if (res && res.choices && Array.isArray(res.choices) && res.choices[0]?.message?.content) {
-      return res.choices[0].message.content;
-    }
-    return typeof res === 'string' ? res : JSON.stringify(res).slice(0, 8000);
-  }
-
-  private stagePrompt(stageNumber: number, chunkText: string, memorySummary: string, termDictionary: Record<string,string>, styleHint: string, head: string, tail: string) {
-    switch(stageNumber) {
-      case 1:
-        return `Stage 1 — Structural editing:
-Memory summary: ${memorySummary}
-Terminology: ${JSON.stringify(termDictionary)}
-Style hint: ${styleHint}
-Context head: ${head}
-Context tail: ${tail}
-Task: Improve sentence structure and readability for the following chunk. Preserve meaning. Return only the edited text.
----\n${chunkText}`;
-      case 2:
-        return `Stage 2 — Terminology & consistency:
-Memory summary: ${memorySummary}
-Terminology: ${JSON.stringify(termDictionary)}
-Task: Ensure terminology matches the dictionary and is used consistently. Suggest dictionary updates if new specialized terms appear. Return JSON: {"text":"...","term_updates":{}}.
----\n${chunkText}`;
-      case 3:
-        return `Stage 3 — Tone & Style:
-Memory summary: ${memorySummary}
-Style hint: ${styleHint}
-Task: Convert the chunk to the desired tone/style while preserving meaning. Return only the edited text.
----\n${chunkText}`;
-      case 4:
-        return `Stage 4 — Coherence & Flow:
-Memory summary: ${memorySummary}
-Context head: ${head}
-Context tail: ${tail}
-Task: Improve connectors and transitional phrases to ensure flow inside this chunk and with neighboring context. Return only the edited text.
----\n${chunkText}`;
-      case 5:
-        return `Stage 5 — Final polish:
-Task: Apply final micro-edits: punctuation, minor grammar, idioms. Return only the polished text.
----\n${chunkText}`;
-      default:
-        return chunkText;
-    }
-  }
-
-  private globalCoherencePrompt(assembledText: string, memorySummary: string, termDictionary: Record<string,string>, styleHint: string) {
-    return `GLOBAL COHERENCE PASS
-Memory summary: ${memorySummary}
-Terminology: ${JSON.stringify(termDictionary)}
-Style hint: ${styleHint}
-Task: You are an expert editor. Receive the assembled text and:
-- Ensure consistent tone and terminology across the whole text
-- Remove local inconsistencies and redundant repetitions
-- Insert or adjust connectors between segments where needed
-Return JSON: {"final_text":"...","edit_log":["..."]}
-
-ASSEMBLED:
-${assembledText}`;
-  }
-
-  // -----------------------
-  // Main execute
-  // -----------------------
-  async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
-    const input = this.getInputData(0);
-    const paramText = (this.getNodeParameter as any) ? this.getNodeParameter('text', 0, '') as string : '' ;
-    const targetLanguage = this.getNodeParameter('targetLanguage', 0, 'fa') as string;
-    const styleHint = this.getNodeParameter('styleHint', 0, 'formal') as string;
-    const chunkSize = (this.getNodeParameter('chunkSize', 0, 3000) as number);
-    const memoryMode = this.getNodeParameter('memoryMode', 0, 'workflowStatic') as string;
-
-    let rawText = '';
-    if (paramText && paramText.length > 0) rawText = paramText;
-    else if (input && input[0] && (input[0].json as any).text) rawText = (input[0].json as any).text;
-    else {
-      return [this.prepareOutputData([])];
-    }
-
-    rawText = rawText.replace(/\r\n/g,'\n').replace(/\s+/g,' ').trim();
-
-    const {chunks, heads, tails} = this.chunkText(rawText, chunkSize, 200);
-    const memoryKey = `openai_text_refinery_memory_v1`;
-
-    let memory = await this.readMemory(memoryKey, this, memoryMode);
-    memory.lastUpdated = new Date().toISOString();
-
-    const finalizedChunks: Record<number, {text:string, checksum:string}> = {};
-
-    for (let idx = 0; idx < chunks.length; idx++) {
-      const chunkText = chunks[idx];
-      const head = heads[idx] || '';
-      const tail = tails[idx] || '';
-
-      memory = await this.readMemory(memoryKey, this, memoryMode);
-
-      const translatePrompt = `Translate/ensure language (${targetLanguage}) and preserve named entities. Use short answer format.\n\n${chunkText}`;
-      let translated = chunkText;
-      try {
-        const t = await this.openaiCallFromNode(translatePrompt, this, 1200, 0.0);
-        translated = String(t).trim();
-      } catch (e) {
-        translated = chunkText;
-      }
-
-      let normalized = translated.replace(/\s+/g,' ').trim();
-
-      let currentText = normalized;
-      for (let stage = 1; stage <= 5; stage++) {
-        const prompt = this.stagePrompt(stage, currentText, memory.globalSummary || '', memory.term_dictionary || {}, styleHint, head, tail);
-        try {
-          const out = await this.openaiCallFromNode(prompt, this, 1200, stage === 5 ? 0.0 : 0.1);
-          if (stage === 2) {
-            try {
-              const parsed = JSON.parse(String(out));
-              if (parsed.text) currentText = parsed.text;
-              if (parsed.term_updates && typeof parsed.term_updates === 'object') {
-                memory.term_dictionary = Object.assign({}, memory.term_dictionary || {}, parsed.term_updates);
-              }
-            } catch {
-              currentText = String(out).trim();
-            }
-          } else {
-            currentText = String(out).trim();
-          }
-        } catch (e) {
-          try {
-            const out2 = await this.openaiCallFromNode(prompt, this, 1200, 0.0);
-            currentText = String(out2).trim();
-          } catch (ee) {
-          }
-        }
-
-        const chunkSummary = currentText.slice(0, Math.min(400, currentText.length));
-        memory.chunks = memory.chunks || {};
-        memory.chunks[String(idx)] = memory.chunks[String(idx)] || {};
-        memory.chunks[String(idx)].summary = chunkSummary;
-        memory.chunks[String(idx)].lastStage = stage;
-        memory.version = (memory.version || 0) + 1;
-        memory.lastUpdated = new Date().toISOString();
-        await this.writeMemory(memoryKey, memory, this, memoryMode);
-      }
-
-      const checksum = this.sha256(currentText || '');
-      finalizedChunks[idx] = { text: currentText, checksum };
-
-      memory.chunks = memory.chunks || {};
-      memory.chunks[String(idx)].final_text = currentText;
-      memory.chunks[String(idx)].final_checksum = checksum;
-      memory.lastUpdated = new Date().toISOString();
-      await this.writeMemory(memoryKey, memory, this, memoryMode);
-    }
-
-    const ordered: string[] = [];
-    for (let i = 0; i < chunks.length; i++) {
-      ordered.push(finalizedChunks[i]?.text || '');
-    }
-    const assembled = ordered.join('\n\n');
-
-    const gPrompt = this.globalCoherencePrompt(assembled, memory.globalSummary || '', memory.term_dictionary || {}, styleHint);
-    let finalText = assembled;
-    let editLog: any[] = [];
-    try {
-      const gOut = await this.openaiCallFromNode(gPrompt, this, 2400, 0.0);
-      try {
-        const parsed = JSON.parse(String(gOut));
-        finalText = parsed.final_text || assembled;
-        editLog = parsed.edit_log || [];
-      } catch {
-        finalText = String(gOut).trim();
-      }
-    } catch (e) {
-    }
-
-    memory.finalTextChecksum = this.sha256(finalText);
-    memory.lastUpdated = new Date().toISOString();
-    await this.writeMemory(memoryKey, memory, this, memoryMode);
-
-    const outputItem: INodeExecutionData = {
-      json: {
-        final_text: finalText,
-        chunks_count: chunks.length,
-        edit_log: editLog,
-      },
-    };
-
-    return this.prepareOutputData([outputItem]);
-  }
-}
-
 } from 'n8n-workflow';
 
 type StageConfig = {
@@ -368,6 +15,36 @@ type StageConfig = {
   format?: string;
   condition?: string;
   saveOutput?: boolean;
+};
+
+type MemoryShape = {
+  memoryId?: string;
+  version: number;
+  createdAt?: string;
+  lastUpdated: string;
+  style_profile: {
+    tone?: string;
+    formality?: string;
+    notes?: string;
+  };
+  glossary: {
+    term_map: Record<string, string>;
+    lastModified: string;
+  };
+  context_summary: {
+    short?: string;
+    long?: string;
+  };
+  dynamic_summary?: any;
+  last_edited_tail: {
+    text: string;
+    length_chars: number;
+  };
+  stage_metadata?: any;
+  usage_stats: {
+    totalTokensUsed: number;
+    executions: number;
+  };
 };
 
 export class OpenAITextRefinery implements INodeType {
@@ -383,7 +60,7 @@ export class OpenAITextRefinery implements INodeType {
     outputs: ['main'],
     credentials: [
       {
-        name: 'openAiAccountApi',
+        name: 'openAiApi',
         required: true,
       },
       {
@@ -392,7 +69,6 @@ export class OpenAITextRefinery implements INodeType {
       },
     ],
     properties: [
-      // General
       {
         displayName: 'Input Field',
         name: 'inputField',
@@ -404,40 +80,49 @@ export class OpenAITextRefinery implements INodeType {
         displayName: 'Default Model',
         name: 'defaultModel',
         type: 'options',
-        options: [{ name: 'gpt-5', value: 'gpt-5' }, { name: 'gpt-4.1', value: 'gpt-4.1' }],
-        default: 'gpt-5',
+        options: [
+          { name: 'gpt-4', value: 'gpt-4' },
+          { name: 'gpt-4-turbo', value: 'gpt-4-turbo' },
+          { name: 'gpt-3.5-turbo', value: 'gpt-3.5-turbo' },
+        ],
+        default: 'gpt-4-turbo',
       },
       {
         displayName: 'Default Temperature',
         name: 'defaultTemperature',
         type: 'number',
         default: 0.05,
+        typeOptions: {
+          minValue: 0,
+          maxValue: 2,
+          numberPrecision: 2,
+        },
       },
-      // Chunking
       {
         displayName: 'Chunk Size (chars)',
         name: 'chunkSize',
         type: 'number',
         default: 3500,
+        description: 'Maximum size of each text chunk',
       },
       {
         displayName: 'Overlap (chars)',
         name: 'overlap',
         type: 'number',
         default: 250,
+        description: 'Number of characters to overlap between chunks',
       },
       {
         displayName: 'Split Method',
         name: 'splitMethod',
         type: 'options',
         options: [
-          { name: 'heading-aware', value: 'heading' },
-          { name: 'smart-sentence', value: 'smart' },
-          { name: 'fixed', value: 'fixed' },
+          { name: 'Heading-aware', value: 'heading' },
+          { name: 'Smart-sentence', value: 'smart' },
+          { name: 'Fixed', value: 'fixed' },
         ],
         default: 'heading',
       },
-      // Memory
       {
         displayName: 'Memory Mode',
         name: 'memoryMode',
@@ -454,13 +139,15 @@ export class OpenAITextRefinery implements INodeType {
         name: 'memoryKey',
         type: 'string',
         default: 'default-book',
+        description: 'Unique identifier for this memory context',
       },
-      // Stages collection (up to 10)
       {
         displayName: 'Stages',
         name: 'stages',
         type: 'fixedCollection',
-        typeOptions: { multipleValues: true, minValue: 1, maxValue: 10 },
+        typeOptions: {
+          multipleValues: true,
+        },
         placeholder: 'Add Stage',
         default: {},
         options: [
@@ -468,25 +155,77 @@ export class OpenAITextRefinery implements INodeType {
             displayName: 'Stage',
             name: 'stageValues',
             values: [
-              { displayName: 'Name', name: 'name', type: 'string', default: 'Stage' },
-              { displayName: 'Enabled', name: 'enabled', type: 'boolean', default: true },
-              { displayName: 'Prompt', name: 'prompt', type: 'string', typeOptions: { rows: 6 }, default: 'Edit the input: {{text}}' },
-              { displayName: 'Model (optional)', name: 'model', type: 'string', default: '' },
-              { displayName: 'Temperature', name: 'temperature', type: 'number', default: 0.05 },
-              { displayName: 'Max tokens', name: 'maxTokens', type: 'number', default: 800 },
-              { displayName: 'Output format', name: 'format', type: 'options', options: [{ name: 'text', value: 'text' }, { name: 'json', value: 'json' }], default: 'text' },
-              { displayName: 'Condition (optional)', name: 'condition', type: 'string', default: '' },
-              { displayName: 'Save stage output', name: 'saveOutput', type: 'boolean', default: false }
+              {
+                displayName: 'Name',
+                name: 'name',
+                type: 'string',
+                default: 'Stage',
+              },
+              {
+                displayName: 'Enabled',
+                name: 'enabled',
+                type: 'boolean',
+                default: true,
+              },
+              {
+                displayName: 'Prompt',
+                name: 'prompt',
+                type: 'string',
+                typeOptions: { rows: 6 },
+                default: 'Edit the input: {{text}}',
+              },
+              {
+                displayName: 'Model (optional)',
+                name: 'model',
+                type: 'string',
+                default: '',
+              },
+              {
+                displayName: 'Temperature',
+                name: 'temperature',
+                type: 'number',
+                default: 0.05,
+              },
+              {
+                displayName: 'Max Tokens',
+                name: 'maxTokens',
+                type: 'number',
+                default: 800,
+              },
+              {
+                displayName: 'Output Format',
+                name: 'format',
+                type: 'options',
+                options: [
+                  { name: 'Text', value: 'text' },
+                  { name: 'JSON', value: 'json' },
+                ],
+                default: 'text',
+              },
+              {
+                displayName: 'Condition (optional)',
+                name: 'condition',
+                type: 'string',
+                default: '',
+              },
+              {
+                displayName: 'Save Stage Output',
+                name: 'saveOutput',
+                type: 'boolean',
+                default: false,
+              },
             ],
           },
         ],
       },
-      // Output
       {
         displayName: 'Output Format',
         name: 'outputFormat',
         type: 'options',
-        options: [{ name: 'TXT', value: 'txt' }, { name: 'JSON', value: 'json' }],
+        options: [
+          { name: 'TXT', value: 'txt' },
+          { name: 'JSON', value: 'json' },
+        ],
         default: 'txt',
       },
       {
@@ -499,14 +238,14 @@ export class OpenAITextRefinery implements INodeType {
   };
 
   // ---------- Helper functions ----------
-  private tailOf(text: string, maxChars = 400) {
+  
+  private tailOf(text: string, maxChars = 400): string {
     if (!text) return '';
     const s = text.slice(-maxChars);
-    // find last sentence boundary near start of s
     const re = /[\.؟!\n]\s+/;
     const m = s.match(re);
-    if (m) {
-      const idx = s.indexOf(m[0]);
+    if (m && m.index !== undefined) {
+      const idx = m.index;
       if (idx >= 0 && idx + m[0].length < s.length) {
         return s.slice(idx + m[0].length).trim();
       }
@@ -514,303 +253,223 @@ export class OpenAITextRefinery implements INodeType {
     return s.trim();
   }
 
-  private reassemble(editedChunks: string[], overlapChars = 200) {
+  private reassemble(editedChunks: string[], overlapChars = 200): string {
     if (!editedChunks || !editedChunks.length) return '';
     let result = editedChunks[0];
+    
     for (let i = 1; i < editedChunks.length; i++) {
       const prev = result;
       const curr = editedChunks[i];
       let cut = 0;
-      const maxCheck = Math.min(overlapChars, Math.floor(prev.length / 2), Math.floor(curr.length / 2));
+      const maxCheck = Math.min(
+        overlapChars,
+        Math.floor(prev.length / 2),
+        Math.floor(curr.length / 2)
+      );
+      
       for (let k = maxCheck; k >= 20; k--) {
         if (prev.slice(-k) === curr.slice(0, k)) {
           cut = k;
           break;
         }
       }
-      if (cut) result = prev + curr.slice(cut);
-      else result = prev + '\n\n' + curr;
+      
+      if (cut) {
+        result = prev + curr.slice(cut);
+      } else {
+        result = prev + '\n\n' + curr;
+      }
     }
     return result;
   }
 
-  // load memory (workflowStatic or googleDrive)
-  private async loadMemory(thisNode: IExecuteFunctions, memoryKey: string, mode: string) {
+  private async loadMemory(
+    thisNode: IExecuteFunctions,
+    memoryKey: string,
+    mode: string
+  ): Promise<MemoryShape | null> {
     if (mode === 'workflowStatic') {
       const wfStatic = thisNode.getWorkflowStaticData('global') as any;
       return wfStatic[`memory_${memoryKey}`] || null;
     }
+    
     if (mode === 'googleDrive') {
-      // requires googleDriveOAuth2Api credential in node
-      // file name: openai_text_refinery_memory_<memoryKey>.json
       try {
         const filename = `openai_text_refinery_memory_${memoryKey}.json`;
-        // use Drive API to search file
-        const search = await thisNode.helpers.request!.call(thisNode, {
-          method: 'GET',
-          uri: `https://www.googleapis.com/drive/v3/files?q=name='${encodeURIComponent(filename)}' and trashed=false&fields=files(id,name)`,
-          json: true,
-        });
+        const search = await thisNode.helpers.httpRequestWithAuthentication.call(
+          thisNode,
+          'googleDriveOAuth2Api',
+          {
+            method: 'GET',
+            url: `https://www.googleapis.com/drive/v3/files?q=name='${encodeURIComponent(
+              filename
+            )}' and trashed=false&fields=files(id,name)`,
+            json: true,
+          }
+        );
+        
         if (search && search.files && search.files.length) {
           const fileId = search.files[0].id;
-          const content = await thisNode.helpers.request!.call(thisNode, {
-            method: 'GET',
-            uri: `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
-            json: true,
-          });
-          return content;
+          const content = await thisNode.helpers.httpRequestWithAuthentication.call(
+            thisNode,
+            'googleDriveOAuth2Api',
+            {
+              method: 'GET',
+              url: `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
+              json: true,
+            }
+          );
+          return content as MemoryShape;
         }
       } catch (e) {
-        // ignore, return null
+        // Ignore error, return null
       }
       return null;
     }
+    
     return null;
   }
 
-  private async persistMemory(thisNode: IExecuteFunctions, memoryKey: string, memoryObj: any, mode: string) {
+  private async persistMemory(
+    thisNode: IExecuteFunctions,
+    memoryKey: string,
+    memoryObj: MemoryShape,
+    mode: string
+  ): Promise<boolean> {
     memoryObj.lastUpdated = new Date().toISOString();
     memoryObj.version = (memoryObj.version || 0) + 1;
+    
     if (mode === 'workflowStatic') {
       const wfStatic = thisNode.getWorkflowStaticData('global') as any;
       wfStatic[`memory_${memoryKey}`] = memoryObj;
       return true;
     }
+    
     if (mode === 'googleDrive') {
-      // upload or update file
       const filename = `openai_text_refinery_memory_${memoryKey}.json`;
       const content = JSON.stringify(memoryObj, null, 2);
+      
       try {
-        // find existing
-        const search = await thisNode.helpers.request!.call(thisNode, {
-          method: 'GET',
-          uri: `https://www.googleapis.com/drive/v3/files?q=name='${encodeURIComponent(filename)}' and trashed=false&fields=files(id,name)`,
-          json: true,
-        });
+        const search = await thisNode.helpers.httpRequestWithAuthentication.call(
+          thisNode,
+          'googleDriveOAuth2Api',
+          {
+            method: 'GET',
+            url: `https://www.googleapis.com/drive/v3/files?q=name='${encodeURIComponent(
+              filename
+            )}' and trashed=false&fields=files(id,name)`,
+            json: true,
+          }
+        );
+        
         if (search && search.files && search.files.length) {
           const fileId = search.files[0].id;
-          // update
-          await thisNode.helpers.request!.call(thisNode, {
-            method: 'PATCH',
-            uri: `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,
-            body: content,
-            json: true,
-            headers: { 'Content-Type': 'application/json' },
-          });
+          await thisNode.helpers.httpRequestWithAuthentication.call(
+            thisNode,
+            'googleDriveOAuth2Api',
+            {
+              method: 'PATCH',
+              url: `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,
+              body: content,
+              headers: { 'Content-Type': 'application/json' },
+            }
+          );
         } else {
-          // create
-          // multipart upload (metadata + media)
           const metadata = { name: filename };
           const boundary = '-------314159265358979323846';
           const multipartRequestBody =
             `--${boundary}\r\n` +
             'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
-            JSON.stringify(metadata) + '\r\n' +
+            JSON.stringify(metadata) +
+            '\r\n' +
             `--${boundary}\r\n` +
             'Content-Type: application/json\r\n\r\n' +
-            content + '\r\n' +
+            content +
+            '\r\n' +
             `--${boundary}--`;
-          await thisNode.helpers.request!.call(thisNode, {
-            method: 'POST',
-            uri: 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
-            body: multipartRequestBody,
-            headers: { 'Content-Type': `multipart/related; boundary="${boundary}"` },
-            json: true,
-          });
+            
+          await thisNode.helpers.httpRequestWithAuthentication.call(
+            thisNode,
+            'googleDriveOAuth2Api',
+            {
+              method: 'POST',
+              url: 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
+              body: multipartRequestBody,
+              headers: {
+                'Content-Type': `multipart/related; boundary="${boundary}"`,
+              },
+            }
+          );
         }
         return true;
       } catch (e) {
         return false;
       }
     }
+    
     return false;
   }
 
-  // call OpenAI Responses API via helpers.request (credential applied)
-  private async callOpenAI(thisNode: IExecuteFunctions, model: string, content: string, temperature = 0.05, maxTokens = 800) {
+  private async callOpenAI(
+    thisNode: IExecuteFunctions,
+    model: string,
+    content: string,
+    temperature = 0.05,
+    maxTokens = 800
+  ): Promise<any> {
     const body = {
       model,
-      input: [{ role: 'user', content }],
+      messages: [{ role: 'user', content }],
       temperature,
       max_tokens: maxTokens,
     };
-    const options = {
-      method: 'POST',
-      uri: 'https://api.openai.com/v1/responses',
-      body,
-      json: true,
-    };
-    // this.helpers.request will use the node credential (openAiAccountApi) automatically
-    return thisNode.helpers.request!(options);
+    
+    return await thisNode.helpers.httpRequestWithAuthentication.call(
+      thisNode,
+      'openAiApi',
+      {
+        method: 'POST',
+        url: 'https://api.openai.com/v1/chat/completions',
+        body,
+        json: true,
+      }
+    );
   }
 
-  async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
-    const items = this.getInputData();
-    if (items.length === 0) return this.prepareOutputData([]);
-    // read parameters
-    const inputField = this.getNodeParameter('inputField', 0) as string;
-    const defaultModel = this.getNodeParameter('defaultModel', 0) as string;
-    const defaultTemperature = this.getNodeParameter('defaultTemperature', 0) as number;
-    const chunkSize = this.getNodeParameter('chunkSize', 0) as number;
-    const overlap = this.getNodeParameter('overlap', 0) as number;
-    const splitMethod = this.getNodeParameter('splitMethod', 0) as string;
-    const memoryMode = this.getNodeParameter('memoryMode', 0) as string;
-    const memoryKey = this.getNodeParameter('memoryKey', 0) as string;
-    const stagesRaw = this.getNodeParameter('stages.stageValues', 0, []) as any[];
-    const verbose = this.getNodeParameter('verbose', 0) as boolean;
-    const outputFormat = this.getNodeParameter('outputFormat', 0) as string;
-
-    // normalize stages
-    const stages: StageConfig[] = (stagesRaw || []).map((s: any) => ({
-      name: s.name || 'Stage',
-      enabled: s.enabled !== false,
-      prompt: s.prompt || '',
-      model: s.model || '',
-      temperature: s.temperature ?? defaultTemperature,
-      maxTokens: s.maxTokens ?? 800,
-      format: s.format || 'text',
-      condition: s.condition || '',
-      saveOutput: s.saveOutput || false,
-    }));
-
-    const returnData: INodeExecutionData[] = [];
-
-    // --- process each incoming item (batch support) ---
-    for (let itemIndex = 0; itemIndex < items.length; itemIndex++) {
-      const item = items[itemIndex];
-      let text = (item.json as any)[inputField] || '';
-      // if binary content present, convert
-      if (!text && item.binary) {
-        const keys = Object.keys(item.binary);
-        if (keys.length) {
-          const b = item.binary[keys[0]];
-          const buf = Buffer.from(b.data, b.encoding || 'base64');
-          text = buf.toString('utf8');
-        }
-      }
-      // load memory
-      let currentMemory = (await this.loadMemory(this, memoryKey, memoryMode)) || {
-        memoryId: memoryKey,
-        version: 1,
-        createdAt: new Date().toISOString(),
-        lastUpdated: new Date().toISOString(),
-        style_profile: { tone: '', formality: '', notes: '' },
-        glossary: { term_map: {}, lastModified: new Date().toISOString() },
-        context_summary: { short: '', long: '' },
-        dynamic_summary: {},
-        last_edited_tail: { text: '', length_chars: 0 },
-        stage_metadata: {},
-        usage_stats: { totalTokensUsed: 0, executions: 0 },
-      };
-
-      // chunking
-      const chunks = this.chunkText(text, chunkSize, overlap, splitMethod);
-
-      const editedChunks: string[] = [];
-      const stageOutputsAll: any = {};
-
-      // process chunks serially for best quality
-      for (let c = 0; c < chunks.length; c++) {
-        const chunkObj = chunks[c];
-        let currentChunkText = chunkObj.chunk as string;
-
-        // previousTail injection: prefer memory.last_edited_tail else chunkObj.previousTail
-        let previousTail = currentMemory.last_edited_tail?.text || chunkObj.previousTail || '';
-
-        // run each stage on the current chunk
-        for (let sIndex = 0; sIndex < stages.length; sIndex++) {
-          const st = stages[sIndex];
-          if (!st.enabled) continue;
-          // condition evaluation (simple check) - if condition present and false, skip
-          if (st.condition && st.condition.trim()) {
-            // At this level we don't evaluate complex expressions; assume true or do a basic JSON path check if needed
-          }
-
-          const modelToUse = st.model && st.model.length ? st.model : defaultModel;
-          // build prompt
-          const prompt = this.buildStagePrompt(st, currentChunkText, currentMemory, previousTail);
-
-          // call OpenAI
-          const resp = await this.callOpenAI(this, modelToUse, prompt, st.temperature, st.maxTokens || 800);
-
-          // parse response -> try several shapes
-          const edited = this.parseOpenAIResponse(resp);
-          // if st.format == json we might keep JSON; here we keep plain string
-          const editedText = typeof edited === 'string' ? edited : JSON.stringify(edited);
-
-          // extract tail from editedText
-          const tail = this.tailOf(editedText, Math.max(200, overlap));
-          // update memory in-run
-          currentMemory.last_edited_tail = { text: tail, length_chars: tail.length };
-          // (Optionally) you could extract style/glossary suggestions via a micro-prompt and merge them here.
-
-          // save stage output if requested
-          if (!stageOutputsAll[`stage${sIndex + 1}`]) stageOutputsAll[`stage${sIndex + 1}`] = [];
-          stageOutputsAll[`stage${sIndex + 1}`].push({ chunkIndex: c, output: editedText });
-
-          // pass output to next stage
-          currentChunkText = editedText;
-
-          // accumulate usage stats (approx: we don't have exact token count here)
-          currentMemory.usage_stats.totalTokensUsed = (currentMemory.usage_stats.totalTokensUsed || 0) + 0; // placeholder
-        } // stages loop
-
-        // after all stages for this chunk
-        editedChunks.push(currentChunkText);
-      } // chunks loop
-
-      // reassemble final text
-      const finalText = this.reassemble(editedChunks, overlap);
-
-      // persist memory if requested (we persist by default for workflowStatic and googleDrive)
-      if (memoryMode === 'workflowStatic' || memoryMode === 'googleDrive') {
-        await this.persistMemory(this, memoryKey, currentMemory, memoryMode);
-      }
-
-      // prepare output
-      const outItem: INodeExecutionData = {
-        json: {
-          originalText: text.slice(0, 2000),
-          finalText,
-          stageOutputs: stageOutputsAll,
-          memory: currentMemory,
-        },
-      };
-      if (verbose) outItem.json.rawDebug = {}; // could store raw responses if captured above
-      returnData.push(outItem);
-    } // items loop
-
-    return this.prepareOutputData(returnData);
-  }
-
-  // --- small helpers used by execute: chunkText, buildStagePrompt, parseOpenAIResponse ---
-
-  private chunkText(text: string, chunkSize = 3500, overlap = 250, method = 'heading') {
-    // simple heading-aware chunker: try to cut at headings or paragraphs; fallback to fixed
-    const out: { chunk: string; chunkIndex: number; previousTail?: string }[] = [];
+  private chunkText(
+    text: string,
+    chunkSize = 3500,
+    overlap = 250,
+    method = 'heading'
+  ): Array<{ chunk: string; chunkIndex: number; previousTail?: string }> {
+    const out: Array<{ chunk: string; chunkIndex: number; previousTail?: string }> = [];
     let pos = 0;
     let idx = 0;
+    
     while (pos < text.length) {
       if (pos + chunkSize >= text.length) {
         out.push({ chunk: text.slice(pos), chunkIndex: idx++ });
         break;
       }
+      
       let window = text.slice(pos, pos + chunkSize);
-      // try heading regex
-      const headingMatch = window.match(/(فصل\s*[:\-\s]?\s*[0-9۰-۹]+|CHAPTER\s+\d+|Chapter\s+\d+)/i);
+      const headingMatch = window.match(
+        /(فصل\s*[:\-\s]?\s*[0-9۰-۹]+|CHAPTER\s+\d+|Chapter\s+\d+)/i
+      );
+      
       let cut = -1;
-      if (method === 'heading' && headingMatch) {
-        const mIndex = window.indexOf(headingMatch[0]);
+      if (method === 'heading' && headingMatch && headingMatch.index !== undefined) {
+        const mIndex = headingMatch.index;
         if (mIndex > 100) {
           cut = mIndex;
         }
       }
+      
       if (cut < 0) {
-        // natural cut: last double newline or last sentence end
         let posCut = window.lastIndexOf('\n\n');
-        if (posCut >= Math.floor(chunkSize * 0.6)) cut = posCut;
-        else {
-          // sentence end punctuation
+        if (posCut >= Math.floor(chunkSize * 0.6)) {
+          cut = posCut;
+        } else {
           const endings = ['. ', '? ', '! ', '؟ ', '؛ ', '.\n'];
           for (const e of endings) {
             const p = window.lastIndexOf(e);
@@ -821,21 +480,31 @@ export class OpenAITextRefinery implements INodeType {
           }
         }
       }
+      
       if (cut < 0) cut = chunkSize;
+      
       const piece = text.slice(pos, pos + cut);
       out.push({ chunk: piece, chunkIndex: idx++ });
       pos += cut;
-      // apply overlap by moving back
       pos = Math.max(0, pos - overlap);
     }
+    
     return out;
   }
 
-  private buildStagePrompt(stage: StageConfig, chunkText: string, memory: any, previousTail: string) {
-    // inject memory and previousTail at top
-    const styleNotes = (memory && memory.style_profile && memory.style_profile.notes) ? memory.style_profile.notes : '';
-    const glossary = memory && memory.glossary && memory.glossary.term_map ? Object.entries(memory.glossary.term_map).map(([k,v]) => `${k} = ${v}`).join('\n') : '';
-    const contextShort = memory && memory.context_summary && memory.context_summary.short ? memory.context_summary.short : '';
+  private buildStagePrompt(
+    stage: StageConfig,
+    chunkText: string,
+    memory: MemoryShape,
+    previousTail: string
+  ): string {
+    const styleNotes = memory?.style_profile?.notes || '';
+    const glossary = memory?.glossary?.term_map
+      ? Object.entries(memory.glossary.term_map)
+          .map(([k, v]) => `${k} = ${v}`)
+          .join('\n')
+      : '';
+    const contextShort = memory?.context_summary?.short || '';
 
     const promptParts = [
       '# MEMORY',
@@ -860,33 +529,147 @@ export class OpenAITextRefinery implements INodeType {
       'Input chunk:',
       chunkText,
       '',
-      'Return ONLY the edited chunk (no commentary).'
+      'Return ONLY the edited chunk (no commentary).',
     ];
+    
     return promptParts.join('\n');
   }
 
-  private parseOpenAIResponse(resp: any) {
+  private parseOpenAIResponse(resp: any): string {
     if (!resp) return '';
-    // Responses API shapes vary; try common fields
-    if (resp.output && Array.isArray(resp.output) && resp.output.length) {
-      // often output[0].content or text
-      const o = resp.output[0];
-      if (typeof o === 'string') return o;
-      if (o.content && Array.isArray(o.content) && o.content.length) {
-        return o.content.map((c: any) => (typeof c === 'string' ? c : c.text || '')).join('');
-      }
-      if (o.text) return o.text;
-    }
-    if (resp.output_text) {
-      return Array.isArray(resp.output_text) ? resp.output_text.join('') : resp.output_text;
-    }
+    
+    // Standard chat completions format
     if (resp.choices && Array.isArray(resp.choices) && resp.choices[0]) {
-      if (resp.choices[0].message && resp.choices[0].message.content) {
-        if (typeof resp.choices[0].message.content === 'string') return resp.choices[0].message.content;
-        if (resp.choices[0].message.content.parts) return resp.choices[0].message.content.parts.join('');
+      if (resp.choices[0].message?.content) {
+        return resp.choices[0].message.content;
       }
-      if (resp.choices[0].text) return resp.choices[0].text;
+      if (resp.choices[0].text) {
+        return resp.choices[0].text;
+      }
     }
-    try { return JSON.stringify(resp); } catch (e) { return String(resp); }
+    
+    try {
+      return JSON.stringify(resp);
+    } catch (e) {
+      return String(resp);
+    }
+  }
+
+  async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
+    const items = this.getInputData();
+    if (items.length === 0) return [[]];
+
+    const inputField = this.getNodeParameter('inputField', 0) as string;
+    const defaultModel = this.getNodeParameter('defaultModel', 0) as string;
+    const defaultTemperature = this.getNodeParameter('defaultTemperature', 0) as number;
+    const chunkSize = this.getNodeParameter('chunkSize', 0) as number;
+    const overlap = this.getNodeParameter('overlap', 0) as number;
+    const splitMethod = this.getNodeParameter('splitMethod', 0) as string;
+    const memoryMode = this.getNodeParameter('memoryMode', 0) as string;
+    const memoryKey = this.getNodeParameter('memoryKey', 0) as string;
+    const stagesRaw = this.getNodeParameter('stages.stageValues', 0, []) as any[];
+    const verbose = this.getNodeParameter('verbose', 0) as boolean;
+
+    const stages: StageConfig[] = (stagesRaw || []).map((s: any) => ({
+      name: s.name || 'Stage',
+      enabled: s.enabled !== false,
+      prompt: s.prompt || '',
+      model: s.model || '',
+      temperature: s.temperature ?? defaultTemperature,
+      maxTokens: s.maxTokens ?? 800,
+      format: s.format || 'text',
+      condition: s.condition || '',
+      saveOutput: s.saveOutput || false,
+    }));
+
+    const returnData: INodeExecutionData[] = [];
+
+    for (let itemIndex = 0; itemIndex < items.length; itemIndex++) {
+      const item = items[itemIndex];
+      let text = (item.json as any)[inputField] || '';
+
+      if (!text && item.binary) {
+        const keys = Object.keys(item.binary);
+        if (keys.length) {
+          const b = item.binary[keys[0]];
+          const buf = Buffer.from(b.data, 'base64');
+          text = buf.toString('utf8');
+        }
+      }
+
+      let currentMemory: MemoryShape =
+        (await this.loadMemory(this, memoryKey, memoryMode)) || {
+          version: 1,
+          createdAt: new Date().toISOString(),
+          lastUpdated: new Date().toISOString(),
+          style_profile: { tone: '', formality: '', notes: '' },
+          glossary: { term_map: {}, lastModified: new Date().toISOString() },
+          context_summary: { short: '', long: '' },
+          last_edited_tail: { text: '', length_chars: 0 },
+          usage_stats: { totalTokensUsed: 0, executions: 0 },
+        };
+
+      const chunks = this.chunkText(text, chunkSize, overlap, splitMethod);
+      const editedChunks: string[] = [];
+      const stageOutputsAll: any = {};
+
+      for (let c = 0; c < chunks.length; c++) {
+        const chunkObj = chunks[c];
+        let currentChunkText = chunkObj.chunk;
+        const previousTail = currentMemory.last_edited_tail?.text || '';
+
+        for (let sIndex = 0; sIndex < stages.length; sIndex++) {
+          const st = stages[sIndex];
+          if (!st.enabled) continue;
+
+          const modelToUse = st.model && st.model.length ? st.model : defaultModel;
+          const prompt = this.buildStagePrompt(st, currentChunkText, currentMemory, previousTail);
+
+          const resp = await this.callOpenAI(
+            this,
+            modelToUse,
+            prompt,
+            st.temperature,
+            st.maxTokens || 800
+          );
+
+          const editedText = this.parseOpenAIResponse(resp);
+          const tail = this.tailOf(editedText, Math.max(200, overlap));
+          currentMemory.last_edited_tail = { text: tail, length_chars: tail.length };
+
+          if (!stageOutputsAll[`stage${sIndex + 1}`]) {
+            stageOutputsAll[`stage${sIndex + 1}`] = [];
+          }
+          stageOutputsAll[`stage${sIndex + 1}`].push({
+            chunkIndex: c,
+            output: editedText,
+          });
+
+          currentChunkText = editedText;
+        }
+
+        editedChunks.push(currentChunkText);
+      }
+
+      const finalText = this.reassemble(editedChunks, overlap);
+
+      if (memoryMode === 'workflowStatic' || memoryMode === 'googleDrive') {
+        await this.persistMemory(this, memoryKey, currentMemory, memoryMode);
+      }
+
+      const outItem: INodeExecutionData = {
+        json: {
+          originalText: text.slice(0, 2000),
+          finalText,
+          chunksCount: chunks.length,
+          stageOutputs: verbose ? stageOutputsAll : undefined,
+          memoryVersion: currentMemory.version,
+        },
+      };
+
+      returnData.push(outItem);
+    }
+
+    return [returnData];
   }
 }
