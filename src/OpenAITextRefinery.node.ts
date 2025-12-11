@@ -2,7 +2,360 @@ import {
   IExecuteFunctions,
   INodeExecutionData,
   INodeType,
+  INodeTypeDescription,// src/OpenAITextRefinery.node.ts
+// A conservative, robust n8n node skeleton implementing the smart-chunk pipeline
+// Uses many `as any` casts to avoid strict TS breakage inside different n8n setups.
+// Requires: OpenAI API key in env OPENAI_API_KEY (or adapt to use n8n credentials/helpers).
+
+import { IExecuteFunctions } from 'n8n-core';
+import {
+  INodeType,
   INodeTypeDescription,
+  INodeExecutionData,
+} from 'n8n-workflow';
+
+type MemoryShape = {
+  version?: number;
+  style_profile?: any;
+  term_dictionary?: Record<string,string>;
+  globalSummary?: string;
+  chunks?: Record<string, any>;
+  lastUpdated?: string;
+};
+
+export default class OpenAITextRefinery implements INodeType {
+  description: INodeTypeDescription = {
+    displayName: 'OpenAI Text Refinery (Smart Node)',
+    name: 'openaiTextRefinerySmart',
+    group: ['transform'],
+    version: 1,
+    description: 'Smart node: chunking + memory + multi-stage editing + final coherence',
+    defaults: { name: 'OpenAI Text Refinery (Smart)' , color: '#1A82e2' },
+    inputs: ['main'],
+    outputs: ['main'],
+    credentials: [],
+    properties: [
+      {
+        displayName: 'Target language',
+        name: 'targetLanguage',
+        type: 'string',
+        default: 'fa',
+        description: 'Target language code (e.g. fa, en)',
+      },
+      {
+        displayName: 'Style hint',
+        name: 'styleHint',
+        type: 'string',
+        default: 'formal',
+        description: 'Preferred style (formal, casual, academic...)',
+      },
+      {
+        displayName: 'Chunk size (chars)',
+        name: 'chunkSize',
+        type: 'number',
+        default: 3000,
+      },
+      {
+        displayName: 'Memory mode',
+        name: 'memoryMode',
+        type: 'options',
+        options: [
+          { name: 'workflowStatic', value: 'workflowStatic' },
+          { name: 'none', value: 'none' },
+        ],
+        default: 'workflowStatic',
+      },
+    ],
+  };
+
+  // -----------------------
+  // Helper utilities
+  // -----------------------
+  private sha256(str: string) : string {
+    let h = 0;
+    if (str.length === 0) return '0';
+    for (let i = 0; i < str.length; i++) {
+      const c = str.charCodeAt(i);
+      h = ((h << 5) - h) + c;
+      h |= 0;
+    }
+    return String(h);
+  }
+
+  private chunkText(text: string, maxSize = 3000, overlap = 200) : {chunks:string[], heads:string[], tails:string[]} {
+    if (!text) return {chunks:[], heads:[], tails:[]};
+    const sentences = text.split(/(?<=[.؟!?]\s+)/u);
+    const chunks: string[] = [];
+    let cur = '';
+    for (let i = 0; i < sentences.length; i++) {
+      const s = sentences[i];
+      if ((cur + s).length <= maxSize || cur.length === 0) {
+        cur += s;
+      } else {
+        chunks.push(cur.trim());
+        cur = s;
+      }
+    }
+    if (cur.trim()) chunks.push(cur.trim());
+    const heads = chunks.map((c, idx) => {
+      if (idx === 0) return '';
+      const prev = chunks[idx-1];
+      return prev.slice(Math.max(0, prev.length - Math.min(200, prev.length)));
+    });
+    const tails = chunks.map((c, idx) => {
+      if (idx === chunks.length-1) return '';
+      const next = chunks[idx+1];
+      return next.slice(0, Math.min(200, next.length));
+    });
+    return {chunks, heads, tails};
+  }
+
+  // Memory I/O using workflow static data
+  private async readMemory(memoryKey: string, thisNode: IExecuteFunctions, mode: string) : Promise<MemoryShape> {
+    try {
+      if (mode === 'workflowStatic') {
+        const wf = (thisNode as any).getWorkflowStaticData('global') as any;
+        return (wf?.[memoryKey] ?? { version: 0, style_profile: {}, term_dictionary: {}, chunks: {} }) as MemoryShape;
+      }
+    } catch (e) { /* ignore */ }
+    return { version: 0, style_profile: {}, term_dictionary: {}, chunks: {} };
+  }
+
+  private async writeMemory(memoryKey: string, mem: MemoryShape, thisNode: IExecuteFunctions, mode: string) {
+    try {
+      if (mode === 'workflowStatic') {
+        const wf = (thisNode as any).getWorkflowStaticData('global') as any;
+        wf[memoryKey] = mem;
+        return true;
+      }
+    } catch (e) {
+      return false;
+    }
+    return false;
+  }
+
+  // wrappers to prepare OpenAI call options (we'll call via this.helpers.request)
+  private async callOpenAIAPI(prompt: string, maxTokens=800, temperature=0.0) {
+    const key = process.env.OPENAI_API_KEY;
+    if (!key) throw new Error('OPENAI_API_KEY not set in environment');
+    const options: any = {
+      method: 'POST',
+      uri: 'https://api.openai.com/v1/responses',
+      headers: {
+        Authorization: `Bearer ${key}`,
+        'Content-Type': 'application/json',
+      },
+      body: {
+        model: 'gpt-4o-mini',
+        input: prompt,
+        temperature,
+        max_tokens: maxTokens,
+      },
+      json: true,
+    };
+    return options;
+  }
+
+  private async openaiCallFromNode(prompt: string, thisNode: IExecuteFunctions, maxTokens=800, temperature=0.0) {
+    const reqOptions = await this.callOpenAIAPI(prompt, maxTokens, temperature);
+    const res = await (thisNode as any).helpers.request!(reqOptions as any).catch((e: any) => { throw e; });
+    if (res && res.output && Array.isArray(res.output) && res.output.length) {
+      const out = res.output[0];
+      if (typeof out === 'string') return out;
+      if (out.content) {
+        if (typeof out.content === 'string') return out.content;
+        if (Array.isArray(out.content)) return out.content.map((c:any)=> c?.text ?? (typeof c === 'string' ? c : '')).join('\n');
+      }
+    }
+    if (res && res.choices && Array.isArray(res.choices) && res.choices[0]?.message?.content) {
+      return res.choices[0].message.content;
+    }
+    return typeof res === 'string' ? res : JSON.stringify(res).slice(0, 8000);
+  }
+
+  private stagePrompt(stageNumber: number, chunkText: string, memorySummary: string, termDictionary: Record<string,string>, styleHint: string, head: string, tail: string) {
+    switch(stageNumber) {
+      case 1:
+        return `Stage 1 — Structural editing:
+Memory summary: ${memorySummary}
+Terminology: ${JSON.stringify(termDictionary)}
+Style hint: ${styleHint}
+Context head: ${head}
+Context tail: ${tail}
+Task: Improve sentence structure and readability for the following chunk. Preserve meaning. Return only the edited text.
+---\n${chunkText}`;
+      case 2:
+        return `Stage 2 — Terminology & consistency:
+Memory summary: ${memorySummary}
+Terminology: ${JSON.stringify(termDictionary)}
+Task: Ensure terminology matches the dictionary and is used consistently. Suggest dictionary updates if new specialized terms appear. Return JSON: {"text":"...","term_updates":{}}.
+---\n${chunkText}`;
+      case 3:
+        return `Stage 3 — Tone & Style:
+Memory summary: ${memorySummary}
+Style hint: ${styleHint}
+Task: Convert the chunk to the desired tone/style while preserving meaning. Return only the edited text.
+---\n${chunkText}`;
+      case 4:
+        return `Stage 4 — Coherence & Flow:
+Memory summary: ${memorySummary}
+Context head: ${head}
+Context tail: ${tail}
+Task: Improve connectors and transitional phrases to ensure flow inside this chunk and with neighboring context. Return only the edited text.
+---\n${chunkText}`;
+      case 5:
+        return `Stage 5 — Final polish:
+Task: Apply final micro-edits: punctuation, minor grammar, idioms. Return only the polished text.
+---\n${chunkText}`;
+      default:
+        return chunkText;
+    }
+  }
+
+  private globalCoherencePrompt(assembledText: string, memorySummary: string, termDictionary: Record<string,string>, styleHint: string) {
+    return `GLOBAL COHERENCE PASS
+Memory summary: ${memorySummary}
+Terminology: ${JSON.stringify(termDictionary)}
+Style hint: ${styleHint}
+Task: You are an expert editor. Receive the assembled text and:
+- Ensure consistent tone and terminology across the whole text
+- Remove local inconsistencies and redundant repetitions
+- Insert or adjust connectors between segments where needed
+Return JSON: {"final_text":"...","edit_log":["..."]}
+
+ASSEMBLED:
+${assembledText}`;
+  }
+
+  // -----------------------
+  // Main execute
+  // -----------------------
+  async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
+    const input = this.getInputData(0);
+    const paramText = (this.getNodeParameter as any) ? this.getNodeParameter('text', 0, '') as string : '' ;
+    const targetLanguage = this.getNodeParameter('targetLanguage', 0, 'fa') as string;
+    const styleHint = this.getNodeParameter('styleHint', 0, 'formal') as string;
+    const chunkSize = (this.getNodeParameter('chunkSize', 0, 3000) as number);
+    const memoryMode = this.getNodeParameter('memoryMode', 0, 'workflowStatic') as string;
+
+    let rawText = '';
+    if (paramText && paramText.length > 0) rawText = paramText;
+    else if (input && input[0] && (input[0].json as any).text) rawText = (input[0].json as any).text;
+    else {
+      return [this.prepareOutputData([])];
+    }
+
+    rawText = rawText.replace(/\r\n/g,'\n').replace(/\s+/g,' ').trim();
+
+    const {chunks, heads, tails} = this.chunkText(rawText, chunkSize, 200);
+    const memoryKey = `openai_text_refinery_memory_v1`;
+
+    let memory = await this.readMemory(memoryKey, this, memoryMode);
+    memory.lastUpdated = new Date().toISOString();
+
+    const finalizedChunks: Record<number, {text:string, checksum:string}> = {};
+
+    for (let idx = 0; idx < chunks.length; idx++) {
+      const chunkText = chunks[idx];
+      const head = heads[idx] || '';
+      const tail = tails[idx] || '';
+
+      memory = await this.readMemory(memoryKey, this, memoryMode);
+
+      const translatePrompt = `Translate/ensure language (${targetLanguage}) and preserve named entities. Use short answer format.\n\n${chunkText}`;
+      let translated = chunkText;
+      try {
+        const t = await this.openaiCallFromNode(translatePrompt, this, 1200, 0.0);
+        translated = String(t).trim();
+      } catch (e) {
+        translated = chunkText;
+      }
+
+      let normalized = translated.replace(/\s+/g,' ').trim();
+
+      let currentText = normalized;
+      for (let stage = 1; stage <= 5; stage++) {
+        const prompt = this.stagePrompt(stage, currentText, memory.globalSummary || '', memory.term_dictionary || {}, styleHint, head, tail);
+        try {
+          const out = await this.openaiCallFromNode(prompt, this, 1200, stage === 5 ? 0.0 : 0.1);
+          if (stage === 2) {
+            try {
+              const parsed = JSON.parse(String(out));
+              if (parsed.text) currentText = parsed.text;
+              if (parsed.term_updates && typeof parsed.term_updates === 'object') {
+                memory.term_dictionary = Object.assign({}, memory.term_dictionary || {}, parsed.term_updates);
+              }
+            } catch {
+              currentText = String(out).trim();
+            }
+          } else {
+            currentText = String(out).trim();
+          }
+        } catch (e) {
+          try {
+            const out2 = await this.openaiCallFromNode(prompt, this, 1200, 0.0);
+            currentText = String(out2).trim();
+          } catch (ee) {
+          }
+        }
+
+        const chunkSummary = currentText.slice(0, Math.min(400, currentText.length));
+        memory.chunks = memory.chunks || {};
+        memory.chunks[String(idx)] = memory.chunks[String(idx)] || {};
+        memory.chunks[String(idx)].summary = chunkSummary;
+        memory.chunks[String(idx)].lastStage = stage;
+        memory.version = (memory.version || 0) + 1;
+        memory.lastUpdated = new Date().toISOString();
+        await this.writeMemory(memoryKey, memory, this, memoryMode);
+      }
+
+      const checksum = this.sha256(currentText || '');
+      finalizedChunks[idx] = { text: currentText, checksum };
+
+      memory.chunks = memory.chunks || {};
+      memory.chunks[String(idx)].final_text = currentText;
+      memory.chunks[String(idx)].final_checksum = checksum;
+      memory.lastUpdated = new Date().toISOString();
+      await this.writeMemory(memoryKey, memory, this, memoryMode);
+    }
+
+    const ordered: string[] = [];
+    for (let i = 0; i < chunks.length; i++) {
+      ordered.push(finalizedChunks[i]?.text || '');
+    }
+    const assembled = ordered.join('\n\n');
+
+    const gPrompt = this.globalCoherencePrompt(assembled, memory.globalSummary || '', memory.term_dictionary || {}, styleHint);
+    let finalText = assembled;
+    let editLog: any[] = [];
+    try {
+      const gOut = await this.openaiCallFromNode(gPrompt, this, 2400, 0.0);
+      try {
+        const parsed = JSON.parse(String(gOut));
+        finalText = parsed.final_text || assembled;
+        editLog = parsed.edit_log || [];
+      } catch {
+        finalText = String(gOut).trim();
+      }
+    } catch (e) {
+    }
+
+    memory.finalTextChecksum = this.sha256(finalText);
+    memory.lastUpdated = new Date().toISOString();
+    await this.writeMemory(memoryKey, memory, this, memoryMode);
+
+    const outputItem: INodeExecutionData = {
+      json: {
+        final_text: finalText,
+        chunks_count: chunks.length,
+        edit_log: editLog,
+      },
+    };
+
+    return this.prepareOutputData([outputItem]);
+  }
+}
+
 } from 'n8n-workflow';
 
 type StageConfig = {
